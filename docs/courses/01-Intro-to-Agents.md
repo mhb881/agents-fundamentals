@@ -128,6 +128,54 @@ export async function runAgent(
 
 我们将在后续课程中逐步加入这些能力。
 
+---
+
+### 关于代码的 `callbacks` 参数
+
+简而言之：**它是 Agent 底层逻辑（`run.ts`）与外部界面交互层（`App.tsx`）之间的“事件通信桥梁”**。
+
+`run.ts` 只关注 Agent 的认知与执行流程（调用模型、解析工具、递归循环），不直接依赖具体的界面代码。通过 `callbacks`，它可以在运行过程中把状态**事件驱动**地通知给上层 UI。
+
+#### 1. `AgentCallbacks` 接口定义
+
+在 [src/types.ts](file:///d:/WorkSpace/大师课/ai-courses/作者-Scott-Moss/agents-v2/src/types.ts#L1-L8) 中，它的完整定义如下：
+
+```typescript
+export interface AgentCallbacks {
+  onToken: (token: string) => void;
+  onToolCallStart: (name: string, args: unknown) => void;
+  onToolCallEnd: (name: string, result: string) => void;
+  onComplete: (response: string) => void;
+  onToolApproval: (name: string, args: unknown) => Promise<boolean>;
+  onTokenUsage?: (usage: TokenUsageInfo) => void;
+}
+```
+
+---
+
+#### 2. 各回调函数的具体作用与 UI 对应关系
+
+在 [src/ui/App.tsx](file:///d:/WorkSpace/大师课/ai-courses/作者-Scott-Moss/agents-v2/src/ui/App.tsx#L46-L88) 中，UI 就是通过传入这一组回调来实现终端交互的：
+
+| 回调函数                      | 触发时机                                | 在终端 UI 中的具体作用                                       |
+| :---------------------------- | :-------------------------------------- | :----------------------------------------------------------- |
+| `onToken(token)`              | 模型流式生成文本中的每一个字符/分块     | 实时拼接文本，在终端实现**打字机流式输出**效果。             |
+| `onToolCallStart(name, args)` | 模型决定调用某个工具时                  | 终端立即弹出对应工具卡片，展示入参，并显示正在执行的 **Spinner 加载动画**（状态为 `pending`）。 |
+| `onToolCallEnd(name, result)` | 本地执行工具完毕并拿到返回值时          | 将该工具卡片状态更新为 `complete`，并展示执行结果。          |
+| `onToolApproval(name, args)`  | **调用敏感工具前（如 Shell 命令）**     | **触发人机协同（HITL）**：暂停代码执行并返回一个 `Promise<boolean>`，终端弹出 `[Yes / No]` 审批弹窗，用户回车确认后才会继续执行。 |
+| `onTokenUsage(usage)`         | 统计完本轮对话消耗的 Token 时           | 驱动终端底部的 **Token 水位计（TokenUsage 组件）**，显示当前上下文占比（如 `18.5%`）。 |
+| `onComplete(response)`        | 整个 Agent 循环全部结束、最终响应完成时 | 将最终完整的回答归档进历史消息列表，重置临时输入流状态。     |
+
+---
+
+#### 3. 为什么设计为可选参数？
+
+将它设为可选，实现了 **UI 与 Agent 核心解耦（Headless 架构）**：
+1. **带 UI 运行**：启动完整的终端应用（`pnpm dev`）时，`App.tsx` 会传入这些 callbacks，呈现漂亮的交互界面。
+2. **无头模式 / 测试模式**：在单元测试、跑评测（`evals/`）、或者像你当前文件底部写的本地简单自测 `runAgent("你好，你在吗？")` 时，**完全不需要传 callbacks**，直接在控制台执行即可。
+
+---
+
 ## 核心要点
 
 1. **智能体 = LLM + 动作 + 循环**：由模型自主决策并持续执行，直到完成任务。
@@ -143,14 +191,22 @@ export async function runAgent(
 
 ---
 
-### 译注与代码说明
+## 课中笔记
 
-1. **术语选择**：
-* **Agent**：中文技术圈常译为“智能体”，也有大量工程实践文档直接保留英文 `Agent`；为保持行文连贯，本译文统一采用**智能体**。
-* **context**：结合后文“More memory means more complex tasks”，此处指模型的**上下文（窗口/记忆容量）**，而非一般编程语境中的“执行上下文”。
+**构建一个 agent 的艺术并不难，但让一个 agent 变好、变强大的难度是无限大**。
 
+1. 在使用大语言模型（LLMs）时，`generateText` 函数的目的是什么？
 
-2. **原文代码可能存在的问题**：
-* **缺少返回值**：`runAgent` 的返回类型签名为 `Promise<any>`，但函数体内部仅执行了 `console.log(text)`，未写 `return` 语句（实际返回 `Promise<void>`）。
-* **未使用的函数参数**：`conversationHistory` 和 `callbacks` 已在参数列表中声明，但函数体内部均未使用（作者在正文中提到当前版本暂未使用对话历史，推测这两个参数是为后续课程预留的接口签名；若项目开启了严格的 TypeScript 静态检查，可能会触发未使用变量告警）。
-* **显式 `.ts` 导入后缀**：`"./system/prompt.ts"` 和 `"../types.ts"` 直接带有 `.ts` 扩展名，在标准 `tsc` 编译环境下需要开启 `allowImportingTsExtensions` 选项才能通过校验（在 Bun、Deno 或现代构建工具中可正常运行）。
+   `generateText` 函数用于从语言模型生成文本响应。你向它提供模型、提示词（用户消息）以及可选的系统提示词，它会根据这些输入返回生成的文本。
+
+2. 在大语言模型（LLMs）的语境中，什么是系统提示词（system prompt）？
+
+   系统提示词是给大语言模型的基础指令，它为大语言模型预设了背景和指令。例如，它可能包含这样的指令：“你是一个有用的AI系统。你提供清晰、准确且简洁的回复。”这为LLM应如何响应用户查询设定了上下文和行为方式。
+
+3. AI SDK 的提供商适配器模块（如 `@ai-sdk/openai`）的目的是什么？
+
+   提供商适配器模块允许你在使用相同的 SDK 接口时，切换不同的模型提供商（如 OpenAI、Anthropic 等）。这提供了极大的灵活性，让你无需重写代码即可更换大语言模型（LLM）提供商。
+
+4. 在最基础的层面上，大语言模型（LLMs）工作原理的核心概念是什么？
+
+   从本质上讲，大语言模型（LLM）其实很简单：你给它一些文本（输入），它就会生成一些文本（输出）作为响应。其复杂性在于构建复杂的智能体（agents），这些智能体能够进行对话、执行任务，并持续产生良好的结果。

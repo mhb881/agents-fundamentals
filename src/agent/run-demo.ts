@@ -2,7 +2,9 @@ import "dotenv/config";
 import * as readline from "node:readline/promises";
 
 import { deepSeek } from "@ai-sdk/deepseek";
+import { google } from "@ai-sdk/google";
 import { streamText, type ModelMessage } from "ai";
+import { runProxy } from "../lib/runProxy";
 
 const messages: ModelMessage[] = [];
 
@@ -12,13 +14,14 @@ const terminal = readline.createInterface({
 });
 
 async function main() {
+  runProxy();
   while (true) {
     const userInput = await terminal.question("You: ");
 
     messages.push({ role: "user", content: userInput });
 
     const result = await streamText({
-      model: deepSeek("deepseek-v4-flash"),
+      model: google("gemini-3.5-flash-lite"),
       messages,
     });
 
@@ -34,4 +37,4 @@ async function main() {
   }
 }
 
-// main().catch(console.error);
+main().catch(console.error);
