@@ -369,6 +369,743 @@ export async function runAgent(
 }
 ```
 
+这段代码展示的是**从单次 LLM 调用，发展成一个拥有工具执行能力、循环控制能力和可观测性的 Agent Runtime。**
+
+Agent 并不是一个特殊的大模型。它是一个由模型、工具、上下文、循环控制和执行策略共同组成的程序。模型负责决定下一步做什么，普通程序负责执行决定并管理整个过程。
+
+下面就沿着这条思路拆解代码。
+
+---
+
+#### 1. Agent 的核心执行流程
+
+我们用一次完整的工具调用来理解作者要解决的问题。
+
+假设用户问：帮我读取 package.json，然后告诉我项目使用的 React 版本。
+
+Agent 需要做的事情并不是简单地调用一次模型，而是：
+
+```mermaid
+graph TD
+    %% 自定义全局样式
+    classDef default fill:#ffffff,stroke:#e2e8f0,stroke-width:1.5px,color:#334155,rx:8px,ry:8px;
+    classDef blueNode fill:#eff6ff,stroke:#bfdbfe,stroke-width:2px,color:#1e3a8a,rx:8px,ry:8px;
+    classDef greenNode fill:#f0fdf4,stroke:#bbf7d0,stroke-width:2px,color:#166534,rx:8px,ry:8px;
+    classDef branchNode fill:#ffffff,stroke:#cbd5e1,stroke-width:1.5px,color:#334155,rx:8px,ry:8px,text-align:left;
+
+    %% 节点定义
+    N1["<b>1. 接收用户消息</b><br/><span style='font-size:14px;color:#475569'>用户请求 + 历史对话 + System Prompt</span>"]:::blueNode
+    N2["<b>2. 调用 LLM</b><br/><span style='font-size:14px;color:#475569'>模型分析请求，决定直接回答还是调用工具</span>"]:::blueNode
+
+    N1 --> N2
+
+    %% 路径分支
+    A["<div style='text-align:left;padding:5px;'><span style='background-color:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;'>路径 A</span><br/><br/><b>直接生成文本</b><br/><span style='font-size:13px;color:#64748b'>没有工具调用，结束本轮 Agent 执行。</span></div>"]:::branchNode
+    B["<div style='text-align:left;padding:5px;'><span style='background-color:#dbeafe;color:#1e40af;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;'>路径 B</span><br/><br/><b>生成工具调用</b><br/><span style='font-size:13px;color:#64748b'>例如调用 readFile，提供文件路径和参数。</span></div>"]:::branchNode
+
+    N2 --> A
+    N2 --> B
+
+    N3["<b>3. 应用程序执行工具</b><br/><span style='font-size:14px;color:#475569'>executeTool → readFile → 获取文件内容</span>"]:::greenNode
+    N4["<b>4. 将工具执行结果加入消息历史</b><br/><span style='font-size:14px;color:#475569'>Assistant Tool Call + Tool Result</span>"]:::greenNode
+    N5["<b>5. 再次调用 LLM</b><br/><span style='font-size:14px;color:#475569'>模型读取工具结果，决定下一步行动或者组织最终答案。</span>"]:::blueNode
+    N6["<b>6. 返回最终回答</b><br/><span style='font-size:14px;color:#475569'>结束 Agent Loop，返回完整消息历史。</span>"]:::greenNode
+
+    %% 核心逻辑连线（修复了原图路径 A 的走向）
+    B --> N3
+    A -->|"结束循环"| N6
+
+    N3 --> N4
+    N4 --> N5
+
+    %% 循环与结束
+    N5 -->|"如果再次产生工具调用<br/>继续循环"| N3
+    N5 -->|"组织最终答案"| N6
+```
+
+这里最重要的职责划分是：
+
+- **模型负责决策**：根据当前上下文决定直接回答，还是请求调用某个工具。
+- **Agent Runtime 负责控制执行**：接收工具调用请求、检查权限、执行工具、保存结果，并决定是否再次调用模型。
+- **工具负责与外部世界交互**：例如读取文件、搜索网页或执行命令。
+- **消息历史负责保存交互状态**：让下一次模型调用知道之前说过什么、请求过什么工具，以及工具返回了什么。
+
+模型生成的 Tool Call 只是一个结构化请求，不代表工具已经执行。真正执行工具的是应用程序中的 TypeScript 代码。
+
+其中 Agent Runtime 是我们自己的程序进行控制的。
+
+---
+
+#### 2. 作者的代码究竟在做什么？
+
+我们按照代码执行顺序拆解。
+
+##### 2.1 初始化依赖和 Agent 能力
+
+初始化可观察性和导入依赖：
+
+```ts
+import { streamText, type ModelMessage } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { getTracer } from "@lmnr-ai/lmnr";
+
+import { tools } from "./tools/index.ts";
+import { executeTool } from "./executeTool.ts";
+import { SYSTEM_PROMPT } from "./system/prompt.ts";
+
+import { Laminar } from "@lmnr-ai/lmnr";
+
+Laminar.initialize({
+  projectApiKey: process.env.LMNR_API_KEY,
+});
+```
+
+---
+
+##### 2.2 准备对话历史
+
+`runAgent` 接收当前用户消息、历史消息和回调：
+
+```ts
+export async function runAgent(
+  userMessage: string,
+  conversationHistory: ModelMessage[],
+  callbacks: AgentCallbacks,
+): Promise<ModelMessage[]> {
+```
+
+这三个参数分别代表：
+
+1. **userMessage**：当前用户发送的消息。
+
+2. **conversationHistory**：之前的对话历史，类型为 `ModelMessage[]`。它不是简单的字符串数组，而是模型能够理解的结构化消息集合。例如：
+
+   ```ts
+   [
+     {
+       role: "system",
+       content:
+         "You are a helpful AI assistant. You provide clear, accurate, and concise responses to user questions.\n" +
+         "\n" +
+         "Guidelines:\n" +
+         "- Be direct and helpful\n" +
+         "- If you don't know something, say so honestly\n" +
+         "- Provide explanations when they add value\n" +
+         "- Stay focused on the user's actual question",
+     },
+     { role: "user", content: "请问今天几号？现在几点了？" },
+     { role: "assistant", content: [[Object]] },
+     { role: "tool", content: [[Object]] },
+     { role: "assistant", content: [[Object]] },
+   ];
+   ```
+
+   
+
+3. **callbacks**：Agent 执行过程中的回调接口。这里的回调主要用于连接 Agent Runtime 和外部 UI。
+
+   可以理解为：Agent 内部负责执行任务。UI 负责展示执行过程。callbacks 负责将执行过程中的事件传递给 UI。
+
+接着，作者筛选历史消息并组装本轮上下文：
+
+```ts
+const workingHistory = filterCompatibleMessages(conversationHistory);
+
+const messages: ModelMessage[] = [
+  { role: "system", content: SYSTEM_PROMPT },
+  ...workingHistory,
+  { role: "user", content: userMessage },
+];
+
+let fullResponse = "";
+```
+
+为什么需要 `filterCompatibleMessages`？因为**服务端工具（比如 `webSearch`）返回的消息，格式上可能和后续 API 调用不兼容**，直接原样回传会报错，所以要在发送前筛一遍。
+
+作用是**清洗对话历史消息**，把可能导致后续 API 调用出错的消息格式过滤掉。
+
+> 具体实现可以看 github 仓库
+
+构建 `messages` ：
+
+```ts
+const messages: ModelMessage[] = [
+  { role: "system", content: SYSTEM_PROMPT },
+  ...workingHistory,
+  { role: "user", content: userMessage },
+];
+
+let fullResponse = "";
+```
+
+你可能会问，为什么要维护一个 `messages` ？
+
+因为我们在组装本次 LLM 请求的完整上下文。
+
+它由三部分组成：
+
+| 顺序 | 内容                 | 作用                   |
+| :--- | :------------------- | :--------------------- |
+| 1    | System Prompt        | 告诉模型应该如何行动   |
+| 2    | Conversation History | 提供之前发生的事情     |
+| 3    | User Message         | 提供当前需要处理的任务 |
+
+Agent 的每一次模型调用，都需要建立在之前的对话状态之上。工具结果也必须成为这份状态的一部分。**messages 就是 Agent 在当前这次执行过程中维护的对话状态。**
+
+`fullResponse` 用于存储本次 Agent 执行过程中生成的文本内容，便于最终回调或展示。
+
+---
+
+##### 2.3 创建 Agent Loop
+
+我们这里用 `while(true)` 创建循环：
+
+```ts
+while (true) {
+  const result = streamText({
+    model: openai(MODEL_NAME),
+    messages,
+    tools,
+    experimental_telemetry: {
+      isEnabled: true,
+      tracer: getTracer(),
+    },
+  });
+
+  // 读取流、处理工具调用……
+}
+```
+
+需要区分：
+
+- 一次 `streamText()` 代表一次模型生成；
+- 一次 `runAgent()` 可以执行多次模型生成与工具调用，直到达到退出条件
+
+之所以需要循环，是因为模型可能在第一次调用时只提出工具请求。工具执行完毕后，Runtime 必须把结果放进消息历史，再调用模型，让它根据新信息继续判断。
+
+我们自己控制整个 agent loop，而不是交由 vercel ai sdk 来控制，这让应用程序可以在工具执行前后插入自己的业务逻辑。
+
+---
+
+##### 2.4 读取流
+
+作者遍历模型输出流：
+
+```ts
+const toolCalls: ToolCallInfo[] = []; // 记录工具调用信息
+let currentText = ""; // 累计当前模型输出的文本
+let streamError: Error | null = null; // 记录流式输出时的错误
+
+for await (const chunk of result.fullStream) {
+  if (chunk.type === "text-delta") {
+    currentText += chunk.text;
+    callbacks.onToken(chunk.text);
+  }
+
+  if (chunk.type === "tool-call") {
+    const input = "input" in chunk ? chunk.input : {};
+
+    toolCalls.push({
+      toolCallId: chunk.toolCallId,
+      toolName: chunk.toolName,
+      args: input as Record<string, unknown>,
+    });
+
+    callbacks.onToolCallStart(chunk.toolName, input);
+  }
+}
+```
+
+模型的输出并不一定一次性到达。实际收到的内容可能是：
+
+```
+React
+的
+版本
+是
+19.2
+.0
+。
+```
+
+这些逐渐到达的小片段就是流式输出。`for await...of` 可以异步地逐个读取这些数据块。
+
+这里关注两类事件：
+
+1. `text-delta`：模型新生成了一段文本。代码将其累积到 `currentText`，同时通过 `onToken` 通知 UI，**因此用户不必等整段回答生成完才看到内容**。这就是 ChatGPT 一类应用的流式回答体验。
+2. `tool-call`：模型请求调用工具。代码提取工具调用 ID、名称和参数，保存到 `toolCalls`，并通过回调通知外部工具即将开始。
+
+`toolCalls` 是当前这一次模型生成所提出的工具调用集合。它与 `messages` 的作用不同：前者便于 Runtime 执行当前轮次的工具，后者保存完整对话状态。
+
+为什么需要单独记录 `toolCalls` ？因为工具调用事件本身还没有完成工具的实际执行。**接下来应用程序需要根据模型提供的工具名称和参数，决定应该调用哪个函数**。
+
+> llm 给出信息放入 `toolCalls` 中，然后由我们自己来执行
+
+---
+
+##### 2.5 判断是否继续，以及保存模型消息
+
+读取完流之后，作者检查结束原因：
+
+```ts
+const finishReason = await result.finishReason;
+
+if (finishReason !== "tool-calls" || toolCalls.length === 0) {
+  const responseMessages = await result.response;
+  messages.push(...responseMessages.messages);
+  break;
+}
+
+const responseMessages = await result.response;
+messages.push(...responseMessages.messages);
+```
+
+`finishReason` 告诉 Agent 模型这一次为什么停止生成。
+
+| finishReason     | 含义             |
+| :--------------- | :--------------- |
+| `stop`           | 模型正常结束回答 |
+| `tool-calls`     | 模型请求调用工具 |
+| `length`         | 达到输出长度限制 |
+| `content-filter` | 内容过滤导致结束 |
+| `error`          | 发生生成错误     |
+
+我们在这里做判断：只要模型没有请求工具，或者没有捕获到实际工具调用，就退出循环。
+
+> 不过，这里还有一个工程细节：模型可能因为 `length` 或其他异常原因结束。作者当前的实现会把这些非工具调用情况统一视为退出，不代表它们都成功完成了任务。
+
+因为后面的代码都是获取工具信息，然后手动调用工具，所以此时大模型就可以直接停止这次循环了。
+
+最后，在执行工具之前，作者先把本次模型生成的消息追加到 `messages`。这一步不能省略：如果模型提出了 Tool Call，后续 Tool Result 必须能够与这条 Assistant Tool Call 消息对应起来。
+
+---
+
+##### 2.6 执行工具，并把结果交还给模型
+
+下面才是我们真正执行工具的地方：
+
+```ts
+for (const tc of toolCalls) {
+  const result = await executeTool(tc.toolName, tc.args);
+
+  callbacks.onToolCallEnd(tc.toolName, result);
+
+  messages.push({
+    role: "tool",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: tc.toolCallId,
+        toolName: tc.toolName,
+        output: { type: "text", value: result },
+      },
+    ],
+  });
+}
+```
+
+`executeTool` 才是真正执行工具的地方。它根据工具名称和参数找到对应实现，例如读取文件、搜索网页等。
+
+执行结果随后被封装为 Tool Result 消息。`toolCallId` 用于**关联**模型先前提出的**工具调用**与现在得到的**工具结果**：
+
+```
+Assistant: Tool Call (call_123)
+Tool:      Tool Result (call_123)
+```
+
+如果缺少这种关联，模型就难以准确判断某条结果对应哪个工具请求。**所以，工具调用和工具结果不是两条毫无关系的消息，而是一组有明确关联关系的对话记录。**
+
+工具结果追加到 `messages` 后，`while` 进入下一轮，模型便能读取工具结果并继续决策。
+
+整体上，作者实现的是一个手动控制的工具循环：
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent Runtime
+    participant M as Model
+    participant T as Tool
+
+    U->>A: 用户请求
+    A->>M: System Prompt + History + User Message
+    M-->>A: Assistant Tool Call
+    A->>A: 保存 Assistant 消息
+    A->>T: executeTool(name, args)
+    T-->>A: Tool Result
+    A->>A: 保存 Tool Result
+    A->>M: 更新后的完整消息历史
+    M-->>A: 最终文本
+    A-->>U: 返回结果
+```
+
+这也解释了为什么作者没有把工具执行完全交给 AI SDK：Runtime 需要掌握执行时机，才能在工具执行前后加入权限检查、人工审批、日志记录、超时控制等应用逻辑。
+
+---
+
+#### 3. 根据 AI SDK v7 做出的改变
+
+##### 3.1 `fullStream`、`stream` 与响应消息
+
+你将原来的：
+
+```ts
+for await (const chunk of result.fullStream) {
+  // ...
+}
+```
+
+改成：
+
+```ts
+for await (const chunk of result.stream) {
+  // ...
+}
+```
+
+同时把：
+
+```ts
+const responseMessages = await result.response;
+messages.push(...responseMessages.messages);
+```
+
+改成：
+
+```ts
+const responseMessages = await result.responseMessages;
+messages.push(...responseMessages);
+```
+
+这些属于 SDK 接口层面的迁移。它们不应改变 Agent 的核心状态转换：读取本轮生成、保存 Assistant 消息、执行工具、保存 Tool Result，再进入下一轮。
+
+---
+
+##### 3.2 把 `execute` 从工具定义中剥离？
+
+你的代码新增了：
+
+```ts
+const modelTools = Object.fromEntries(
+  Object.entries(tools).map(([name, t]) => [
+    name,
+    {
+      description: t.description,
+      inputSchema: t.inputSchema,
+    },
+  ]),
+);
+```
+
+然后将 `modelTools` 传给 `streamText`，而不把原工具定义中的 `execute` 一起传入。
+
+这是一个重要的架构选择。普通 AI SDK 函数工具通常由工具描述、输入 Schema 和可选的 `execute` 函数组成：
+
+- `description` 告诉模型工具能做什么。
+- `inputSchema` 规定模型需要提供哪些参数。
+- `execute` 是应用程序实际执行工具的函数。
+
+当工具定义包含 `execute` 时，AI SDK 可以在自己的多步工具执行流程中自动执行它。你的 Agent Loop 又会在收到 Tool Call 后调用自己的 `executeTool`。
+
+如果两套执行机制同时生效，就可能导致重复执行，或者让审批逻辑发生在真正执行之后。
+
+因此，你把"提供给模型的工具描述"与"由 Runtime 控制的工具执行函数"分开：
+
+1. 模型只获得工具名称、描述和参数 Schema
+2. 应用程序收到 Tool Call 后，再通过 `executeTool` 执行。这使 Runtime 能够在执行前加入审批、权限检查、参数校验和审计。
+
+需要注意，这种映射只保留了 `description` 和 `inputSchema`。如果工具定义还包含 `strict`、`providerOptions` 或其他 Provider 特有配置，这些属性也会被丢弃。
+
+更稳妥的方式是对普通函数工具保留其他定义，只移除 `execute`：
+
+```ts
+const modelTools = Object.fromEntries(
+  Object.entries(tools).map(([name, t]) => {
+    const { execute: _execute, ...definition } = t;
+    return [name, definition];
+  }),
+);
+```
+
+需要注意：但**这只适用于能够通过这种方式去除执行函数的普通函数工具**。
+
+**Provider 原生工具**需要保留对应 Provider 要求的定义，不能一概转换成普通工具结构。
+
+---
+
+##### 3.3 注册 Laminar Telemetry
+
+Telemetry 解决"如何观察执行过程"。
+
+注册代码：
+
+```ts
+import "dotenv/config";
+export async function registerLaminarTelemetry() {
+  // 判断是否是标准 Node 环境（有 process + process.version）
+  const isNodeRuntime =
+    typeof process !== "undefined" && process.versions?.node;
+  if (!isNodeRuntime) {
+    console.warn("[Laminar] Not running in Node.js, skip register");
+    return;
+  }
+
+  const enableTelemetry = process.env.ENABLE_LMNR_TELEMETRY === "true";
+  if (!enableTelemetry) {
+    console.log("[Laminar] Telemetry disabled by env");
+    return;
+  }
+
+  const apiKey = process.env.LMNR_PROJECT_API_KEY;
+  if (!apiKey) {
+    console.warn("[Laminar] LMNR_PROJECT_API_KEY missing, skip register");
+    return;
+  }
+
+  const { registerTelemetry } = await import("ai");
+  const { LaminarAiSdkTelemetry } = await import("@lmnr-ai/lmnr");
+
+  // 注册全局采集器，并配置：强制 HTTP + 禁用批处理等待（即时发送）
+  registerTelemetry(
+    new LaminarAiSdkTelemetry({
+      laminarOptions: {
+        projectApiKey: apiKey,
+        forceHttp: true, // 强制走 HTTP 443，避免 gRPC 8443 端口被墙或无法代理
+        disableBatch: true, // 禁用 5 秒批处理缓冲，产生 Span 后立即上报，防止脚本提前退出丢数据
+      },
+    }),
+  );
+  console.log("[Laminar] Telemetry registered successfully");
+}
+```
+
+这段代码分为几个步骤：
+
+1. 检查是否处于 Node.js 环境，避免在不适用的运行时执行这套初始化逻辑。
+2. 检查 `ENABLE_LMNR_TELEMETRY`，允许通过环境变量控制是否采集。
+3. 检查项目 API Key，避免在缺少认证信息时注册。
+4. 创建 `LaminarAiSdkTelemetry`，并通过 `registerTelemetry` 注册到 AI SDK。
+
+`forceHttp` 和 `disableBatch` 是你针对当前网络与进程生命周期作出的传输配置选择。
+
+1. `forceHttp`：你希望通过 HTTP 上报追踪数据，而不是使用默认的 gRPC 传输方式。原因是网络环境可能无法正常访问 gRPC 的 8443 端口。它控制的是 Laminar 遥测数据的传输。
+2. `disableBatch`：通常遥测系统会将多个 Span 暂存起来，积累到一定时间或数量之后再批量发送。批处理有利于降低网络请求开销。目前测试只是一个独立的脚本，所以这只是测试所用。
+
+你在模型调用中设置：
+
+```ts
+telemetry: {
+  isEnabled: true,
+  functionId: "agent-run",
+},
+```
+
+`isEnabled` 表示该次调用启用 Telemetry；`functionId` 用于标识这类调用，方便在**追踪系统**中检索。
+
+最后：
+
+```ts
+await Laminar.shutdown();
+```
+
+用于在短生命周期脚本结束前关闭并刷新追踪资源。
+
+> [!tip]
+>
+> 因为：OpenTelemetry 底层默认采用 **批处理缓冲（`BatchSpanProcessor`）**，默认每隔 **5 秒（5000ms）** 才会统一将内存中的 Trace/Span 批量发送到 Laminar 云端。
+>
+>  在单独运行 `run.ts` 脚本时，模型一旦流式输出完毕，Node.js 的事件循环就立即清空退出了（耗时通常仅 1~2 秒），**导致还停留在内存缓冲队列里的 Span 根本来不及向网络发送，就被进程强行销毁了**。
+
+长期运行的服务器应由应用程序生命周期统一管理 Telemetry 的初始化和关闭。这种情况下，它不应该放在每次 Agent 请求结束时执行。
+
+---
+
+##### 3.4 修改后的代码
+
+```ts
+import "dotenv/config"; // 加载环境变量
+import { generateText, isStepCount, streamText, type ModelMessage } from "ai";
+import { deepSeek } from "@ai-sdk/deepseek";
+import { google } from "@ai-sdk/google";
+
+import { tools } from "./tools";
+import { executeTool } from "./tools/executeTools";
+import { SYSTEM_PROMPT } from "./system/prompt";
+import { runProxy } from "../lib/runProxy";
+import type { AgentCallbacks, ToolCallInfo } from "../types";
+import { filterCompatibleMessages } from "./system/filterMessages";
+import { registerLaminarTelemetry } from "../lib/telemetry-register";
+import { Laminar } from "@lmnr-ai/lmnr";
+
+runProxy();
+await registerLaminarTelemetry();
+
+const GOOGLE_MODEL_NAME = "gemini-3.5-flash-lite";
+const DEEPSEEK_MODEL_NAME = "deepseek-v4-flash";
+
+export const runAgent = async (
+  userMessage: string,
+  conversationHistory?: ModelMessage[],
+  callbacks?: AgentCallbacks,
+): Promise<ModelMessage[]> => {
+  // Filter and check if we need to compact the conversation history before starting
+  const workingHistory = filterCompatibleMessages(conversationHistory || []);
+
+  const messages: ModelMessage[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...workingHistory,
+    { role: "user", content: userMessage },
+  ];
+
+  let fullResponse = "";
+
+  // 提取工具的声明
+  // 不传 execute 给 streamText，将执行控制权保留在下方的 executeTool 中（便于触发审批与回调）
+  const modelTools = Object.fromEntries(
+    Object.entries(tools).map(([name, t]) => {
+      const { execute: _execute, ...definition } = t;
+      return [name, definition];
+    }),
+  );
+
+  while (true) {
+    const result = streamText({
+      model: google(GOOGLE_MODEL_NAME),
+      allowSystemInMessages: true,
+      messages,
+      tools: modelTools,
+      telemetry: {
+        isEnabled: true, // 全局注册后默认就是 true，此处可省略
+        functionId: "agent-run", // 可选：自定义追踪链路中的节点名称，便于在 Laminar 中检索
+      },
+    });
+
+    const toolCalls: ToolCallInfo[] = []; // 记录工具调用信息
+    let currentText = ""; // 累计当前模型输出的文本
+    let streamError: Error | null = null; // 记录流式输出时的错误
+
+    // 处理流式输出
+    // 记录每个 token 并触发回调
+    try {
+      for await (const chunk of result.stream) {
+        if (chunk.type === "text-delta") {
+          currentText += chunk.text;
+          if (callbacks?.onToken) {
+            callbacks.onToken(chunk.text);
+          } else {
+            process.stdout.write(chunk.text); // 无 UI 独立测试时直接在终端流式打字
+          }
+        }
+
+        if (chunk.type === "tool-call") {
+          const input = "input" in chunk ? chunk.input : {};
+
+          toolCalls.push({
+            toolCallId: chunk.toolCallId,
+            toolName: chunk.toolName,
+            args: input as Record<string, unknown>,
+          });
+          callbacks?.onToolCallStart(chunk.toolName, input);
+        }
+      }
+    } catch (error) {
+      streamError = error as Error;
+      // If we have some text, continue processing
+      // Otherwise, rethrow if it's not a "no output" error
+      if (
+        !currentText &&
+        !streamError.message.includes("No output generated")
+      ) {
+        throw streamError;
+      }
+    }
+
+    fullResponse += currentText;
+
+    // If stream errored with "no output" and we have no text, try to recover
+    if (streamError && !currentText) {
+      // Add a fallback response
+      fullResponse =
+        "I apologize, but I wasn't able to generate a response. Could you please try rephrasing your message?";
+      if (callbacks?.onToken) {
+        callbacks.onToken(fullResponse);
+      } else {
+        process.stdout.write(fullResponse);
+      }
+      break;
+    }
+
+    const finishReason = await result.finishReason;
+    const responseMessages = await result.responseMessages;
+    messages.push(...responseMessages);
+
+    // 如果模型没有调用工具（或完成回答），退出循环
+    if (finishReason !== "tool-calls" || toolCalls.length === 0) {
+      break;
+    }
+
+    for (const tc of toolCalls) {
+      const result = await executeTool(tc.toolName, tc.args, {});
+      callbacks?.onToolCallEnd(tc.toolName, result);
+
+      messages.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            output: { type: "text", value: result },
+          },
+        ],
+      });
+    }
+  }
+
+  callbacks?.onComplete(fullResponse);
+  console.log(messages);
+  return messages;
+};
+
+// 换成需要查询时间的提示词
+runAgent("写一个c++程序，实现一个简单的计算器，支持加减乘除");
+// await runAgent("你好");
+await Laminar.flush(); // 确保所有数据成功推送到 Laminar 云端后再退出进程
+
+```
+
+---
+
+#### 4. 将课程内容放回 Agent Engineering 的整体框架
+
+这段代码最重要的成果，是建立了一个最基本的 Agent Runtime：模型可以提出行动请求，Runtime 可以执行行动，并把结果反馈给模型。
+
+后续工程能力都是围绕这个闭环逐步扩展的：
+
+| 能力               | 要解决的问题                                 |
+| :----------------- | :------------------------------------------- |
+| Agent Loop         | 如何反复决策、执行工具并继续生成             |
+| Tool System        | 模型可以使用哪些外部能力，参数如何约束       |
+| Context Management | 对话与工具结果不断增长时，如何管理上下文窗口 |
+| Evals              | 如何判断 Agent 是否正确完成任务              |
+| Human Approval     | 哪些操作必须先得到人工批准                   |
+| Sandbox            | 如何限制 Shell、代码和文件操作的执行边界     |
+| Telemetry          | 如何观察模型调用、工具执行和错误             |
+
+可以把它们理解为同一个 Runtime 的不同侧面：
+
+![image-20261119163821670](./03-Single-Turn Evals.assets/image-20261119163821670.png)
+
+理解这段代码时，建议始终抓住三个问题：
+
+1. **为什么要维护 `messages`？**
+   因为下一次模型调用必须看到此前的用户输入、助手决策、工具调用和工具结果；只保存最终文本不足以恢复 Agent 的执行上下文。
+2. **为什么 Tool Call 和 Tool Result 要分开？**
+   因为模型提出的是执行请求，工具结果必须由应用程序产生，并通过调用 ID 与原请求关联。
+3. **为什么 Runtime 应掌握工具执行控制权？**
+   因为权限检查、人工审批、日志、超时、取消和沙箱等机制，都需要在真实执行发生前后由应用程序协调。
+
+当这三个问题理解清楚后，**AI SDK 就只是模型调用与消息协议的一层基础设施**。无论以后使用 AI SDK、其他 Agent SDK，还是自己实现 Runtime，核心执行模型仍然是：**模型决策 → Runtime 执行 → 状态更新 → 模型继续决策**。
+
 ---
 
 ### evals/evaluators.ts
@@ -550,6 +1287,15 @@ export async function singleTurnWithMocks(
  * Runs a complete agent loop with tools returning fixed values.
  */
 ```
+
+本质上这个 `executor` 是一个 agent runner，你可以认为这是 agent runner 的一个变体。
+
+我们只需要两种 runner：
+
+1. 一种是单轮 `executor` ，用于执行单轮评测（single turn evals）
+2. 另一种是多轮 `executor`，它用于执行完整的 Agent 任务，也就是包含多轮（multi-turn）交互和多个循环的任务
+
+
 
 ---
 
@@ -801,6 +1547,12 @@ Shell 工具评测的示例数据集：
 ]
 ```
 
+其中 `data` 是交由 eval 执行器的参数。
+
+然后 `target` 是你希望 Agent 返回的内容。
+
+`catagory` 是之前我们学习到的几种测试集的分类。
+
 ---
 
 ## 运行评测
@@ -815,18 +1567,7 @@ npx tsx evals/shell-tools.eval.ts
 
 运行结果将显示在你的 Laminar 控制台（dashboard）中，你可以查看每个评分器的具体得分以及汇总统计指标。
 
----
 
-### 译注与代码说明
 
-1. **原文代码可能存在的问题（译文中均已原样保留，未作修改）**：
-   * **缺失 `toolSelectionScore` 函数导出**：在 `evals/file-tools.eval.ts` 和 `evals/shell-tools.eval.ts` 中均从 `./evaluators.ts` 导入了 `toolSelectionScore`，正文“评分器”一节也介绍了它的作用（计算 F1 分数），但 `evals/evaluators.ts` 代码片段中只贴出了 `toolsSelected`、`toolsAvoided` 和 `toolOrderCorrect`，遗漏了 `toolSelectionScore` 的定义，直接运行会触发模块导出缺失报错。
-   * **代码注释粘连与残缺片段**：
-     * 多个文件顶部的 `import` 语句在原文排版中丢失了换行（如 `import ...;import ...;`），以及注释结束符 `*/` 与随后的 `export`、`const` 粘连在同一行（虽然在 JS/TS 语法上仍可解析，但可读性较差）。
-     * `evals/executors.ts` 末尾多出了一段 `Multi-turn executor with mocked tools.` 的注释，但下方没有对应函数体（应为原作者截取下一课多轮评测代码时的残留注释）。
-   * **未展示的辅助模块引用**：`src/agent/run.ts` 引入了 `./system/filterMessages.ts` 中的 `filterCompatibleMessages`，`evals/executors.ts` 引入了 `./utils.ts` 和 `./types.ts`，这些文件在当前课程贴出的代码片段中暂未给出。
-   * **变量遮蔽（Variable Shadowing）**：`src/agent/run.ts` 的 `for (const tc of toolCalls)` 循环内部声明了 `const result = await executeTool(...)`，遮蔽了外层 `while` 循环中的 `const result = streamText(...)`（作用域合法，但阅读时需注意区分）。
 
-2. **术语说明**：
-   * **Evals**：AI 工程领域普遍直接称“Evals”或译为“评测”，文中首次出现标注全称，后续统一译为“评测”。
-   * **Scorers / Evaluators**：原文标题将两者并列，代码配置项中用的是 `evaluators`，正文统一译为“评分器”。
+
